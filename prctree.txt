@@ -1,0 +1,312 @@
+#define _POSIX_C_SOURCE 1 //needed for PATH MAX
+#include <limits.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <stdbool.h>
+#include <string.h>
+#include <ctype.h>
+#include <fcntl.h>
+#include <dirent.h>
+#define MAX_BUFFER_SIZE 1024
+
+// Structure to store process information
+struct Process {
+    int pid;
+    int ppid;
+};
+
+// Function to check if a process is defunct (zombie)
+bool checkZombie(int pid) {
+
+    // Create a file path for the process status file in /proc/<PID>/stat
+    char statFilePath[MAX_BUFFER_SIZE];
+    snprintf(statFilePath, sizeof(statFilePath), "/proc/%d/stat", pid);
+
+    // Open the stat file for the specified PID
+    FILE *statFile = fopen(statFilePath, "r");
+    if (statFile == NULL) {
+        perror("Error opening file");
+        return 1;
+    }
+
+    // Read the status from the stat file
+    char status;
+    fscanf(statFile, "%*d %*s %c", &status);
+    fclose(statFile);
+
+    // Check if the process is a zombie
+    if (status == 'Z') {
+        printf("Process with PID %d is a zombie.\n", pid);
+        return true;
+    } else {
+        printf("Process with PID %d is not a zombie.\n", pid);
+        return false;
+    }
+
+}
+
+int get_parent_pid(int pid) {
+    FILE *file;
+    char filename[MAX_BUFFER_SIZE];
+    char line[MAX_BUFFER_SIZE];
+    int ppid = -1; // Default value if the parent process ID is not found
+
+    // Construct the path to the status file of the process
+    snprintf(filename, MAX_BUFFER_SIZE, "/proc/%d/stat", pid);
+
+    // Open the status file for reading
+    FILE *idStat = fopen(filename, "r");
+    if (idStat == NULL) {
+        perror("Error opening file");
+        exit(EXIT_FAILURE);
+    }
+
+    int unused;
+    char comm[1000];
+    char state;
+
+    fscanf(idStat, "%d %s %c %d", &unused, comm, &state, &ppid);
+    //printf("comm = %s\n", comm);
+    //printf("state = %c\n", state);
+    //printf("parent pid = %d\n", ppid);
+
+    // Close the file
+    fclose(idStat);
+
+    return ppid;
+}
+
+void listDirectDescendants(int root_pid) {
+    char pid_str[10]; // Assuming PID can be represented in 10 characters
+    snprintf(pid_str, sizeof(pid_str), "%d", root_pid);
+
+    //printf("PID\n");
+    execlp("ps", "ps", "-o", "pid", "--ppid", pid_str, "--no-headers", (char *)NULL);
+    perror("execlp");
+    exit(EXIT_FAILURE);
+}
+
+void listNonDirectDescendants(int parentPid) {
+    // executes the following command
+    //ps -eo pid,ppid | awk -v pid="1098848" '$2 == pid {print $1}' | xargs pgrep -P | grep -v -E '^1098848$'
+
+    int pipe_fd[2];
+    pid_t child_pid;
+
+    // Create a pipe
+    if (pipe(pipe_fd) == -1) {
+        perror("pipe");
+        exit(EXIT_FAILURE);
+    }
+
+    // Fork a child process
+    if ((child_pid = fork()) == -1) {
+        perror("fork");
+        exit(EXIT_FAILURE);
+    }
+
+    if (child_pid == 0) {
+        // Child process: set up pipes and execute pstree -p <parent_process_pid>
+        close(pipe_fd[0]); // Close read end of the pipe
+        dup2(pipe_fd[1], STDOUT_FILENO); // Redirect stdout to the pipe
+        close(pipe_fd[1]); // Close write end of the pipe
+
+        // Execute pstree command
+        char parentPidStr[10];
+        sprintf(parentPidStr, "%d", parentPid);
+        execlp("pstree", "pstree", "-p", parentPidStr, NULL);
+
+        // If execlp fails
+        perror("execlp");
+        exit(EXIT_FAILURE);
+    } else {
+        // Parent process
+        close(pipe_fd[1]); // Close write end of the pipe
+        dup2(pipe_fd[0], STDIN_FILENO); // Redirect stdin to the pipe
+        close(pipe_fd[0]); // Close read end of the pipe
+
+        // Execute grep -o '[0-9]\+' | grep -v '^<parent_process_pid>$' | awk '{print $1}'
+        execlp("grep", "grep", "-o", "[0-9]\\+", NULL);
+
+        // If execlp fails
+        perror("execlp");
+        exit(EXIT_FAILURE);
+    }
+}
+
+void getSiblings(int processID){
+int target_pid = processID;
+    DIR *proc_dir;
+    struct dirent *entry;
+
+    proc_dir = opendir("/proc");
+    if (proc_dir == NULL) {
+        perror("opendir");
+        return 1;
+    }
+
+    while ((entry = readdir(proc_dir)) != NULL) {
+        if (isdigit(*entry->d_name)) {
+            char stat_path[256];
+            snprintf(stat_path, sizeof(stat_path), "/proc/%s/stat", entry->d_name);
+            FILE *stat_file = fopen(stat_path, "r");
+
+            if (stat_file) {
+                int pid, ppid;
+                char comm[256];
+                fscanf(stat_file, "%d %s %*c %d", &pid, comm, &ppid);
+
+                //checking if the file reading has the same parent pid as the target
+                if (ppid == target_pid && pid != target_pid) {
+                    printf("Sibling PID: %d\n", pid);
+                }
+
+                fclose(stat_file);
+            }
+        }
+    }
+
+    closedir(proc_dir);
+}
+
+// Function to print process information
+void printProcess(int pid, int ppid) {
+    printf("%d %d\n", pid, ppid);
+}
+
+int flag = 0;
+int firstTarget;
+
+// Function to traverse the process tree based on the given options
+void traverseProcessTree(int root, int target, int numTargets, char *option) {
+    struct Process process; //crating a structure
+    process.pid = target;
+    process.ppid = get_parent_pid(target);
+
+    //checking if the current process is a zombie
+    bool isZombie = checkZombie(target);
+
+    //since the options only account for the first target, we are saving the first target only when flag is zero
+    if (flag == 0) {
+        firstTarget = target;
+    }
+
+    //printf("process ID is: %d\n", process.pid);
+    //printf("process PPID is: %d\n", process.ppid);
+    //printf("option is %s \n",option);
+
+
+    if (option == '\0'){
+        if (process.ppid == root && isZombie == false){
+            printProcess(process.pid, process.ppid);
+        }
+    }else {
+        if (strcmp(option,"-id") == 0 ){
+            //printf("we are inside dn \n");
+            if (process.ppid == root && isZombie == false) {
+                printProcess(process.pid, process.ppid);
+                flag++;
+                //exit(EXIT_FAILURE);
+            }
+
+            if (flag == numTargets){
+                listDirectDescendants(firstTarget);
+            }
+        }
+        else if (strcmp(option,"-dn") == 0){
+            //printf("we are inside dn \n");
+            if (process.ppid == root && isZombie == false) {
+                printProcess(process.pid, process.ppid);
+                flag++;
+                //exit(EXIT_FAILURE);
+            }
+
+            if (flag == numTargets){
+                listNonDirectDescendants(firstTarget);
+            }
+        }
+        else if (strcmp(option,"-lp") == 0){
+            //printf("we are inside dn \n");
+            if (process.ppid == root && isZombie == false) {
+                printProcess(process.pid, process.ppid);
+                flag++;
+                //exit(EXIT_FAILURE);
+            }
+
+            if (flag == numTargets){
+                getSiblings(firstTarget);
+            }
+        }
+        else if (strcmp(option,"-zz") == 0){
+            //printf("we are inside dn \n");
+            if (process.ppid == root && isZombie == false) {
+                printProcess(process.pid, process.ppid);
+                flag++;
+                //exit(EXIT_FAILURE);
+            }
+
+            if (flag == numTargets){
+                checkZombie(firstTarget);
+            }
+        }
+        else{
+            printf("invalid options");
+        }
+
+    }
+
+
+}
+
+int main(int argc, char *argv[]) {
+    // Check if the number of arguments is valid
+    if (argc < 3 || argc > 8) {
+        printf("Invalid number of arguments!\n");
+        return 1;
+    }
+
+    // Parse command line arguments
+    int root = atoi(argv[1]);
+
+    int targets[6];
+    int numTargets=0;
+
+    //printf("root is %d \n", root);
+    //printf("argc is %d \n", argc);
+
+    //printf("%s \n", argv[argc-1]);
+
+    //creating a offset for the targets because they start after the first two args
+    int targetOffset = 0;
+    char *option = '\0';
+
+    if (strchr(argv[argc-1], '-')){
+        option = argv[argc-1];
+        targetOffset++;
+    }
+
+    for (int i = 2; i < (argc-targetOffset); i++) {
+        //assigning the targets into the targets array
+        targets[i-2] = atoi(argv[i]);
+        numTargets++;
+
+    }
+
+    /*for (int i=0; i< numTargets+2 ; i++){
+        printf("target is: %d\n", targets[i]);
+    }*/
+
+    //printf("number of targets is : %d \n", numTargets);
+    //printf("option is : %s \n", option);
+
+    // Traverse the process tree and print information based on the given parameters
+    for (int i = 0; i < numTargets; ++i) {
+        traverseProcessTree(root, targets[i], numTargets, option);
+    }
+
+    return 0;
+}
+
